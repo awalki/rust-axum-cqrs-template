@@ -1,26 +1,60 @@
 use std::sync::Arc;
 
-use axum::{Router, extract::State};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::{app::query::get_hello_world::Repository, di::Container};
+use crate::{
+    app::{
+        command::create_user::UserWriteRepository,
+        query::get_user::{GetUser, UserRepository},
+    },
+    di::Container,
+    error::AppError,
+};
 
-pub struct Server<R>
+#[derive(Serialize, Deserialize)]
+struct ErrorResponse {
+    message: String,
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_owned()),
+            AppError::InternalError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_owned(),
+            ),
+        };
+
+        (status, Json(ErrorResponse { message })).into_response()
+    }
+}
+
+pub struct Server<R, Q>
 where
-    R: Repository,
+    R: UserWriteRepository,
+    Q: UserRepository,
 {
     port: u16,
-    container: Arc<Container<R>>,
+    container: Arc<Container<R, Q>>,
 }
-impl<R> Server<R>
+impl<R, Q> Server<R, Q>
 where
-    R: Repository + Send + Sync + 'static,
+    R: UserWriteRepository + Send + Sync + 'static,
+    Q: UserRepository + Send + Sync + 'static,
 {
-    pub fn new(port: u16, container: Arc<Container<R>>) -> Self {
+    pub fn new(port: u16, container: Arc<Container<R, Q>>) -> Self {
         Self { port, container }
     }
     pub async fn run(self) {
-        let app = get_router(self.container.clone());
+        let app = get_router(self.container);
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.port))
             .await
             .unwrap();
@@ -28,59 +62,137 @@ where
     }
 }
 
-async fn handler<R>(State(container): State<Arc<Container<R>>>) -> &'static str
+async fn get_user<R, Q>(
+    State(container): State<Arc<Container<R, Q>>>,
+    Path(id): Path<i64>,
+) -> Result<Json<GetUser>, AppError>
 where
-    R: Repository + Send + Sync + 'static,
+    R: UserWriteRepository + Send + Sync + 'static,
+    Q: UserRepository + Send + Sync + 'static,
 {
-    container.hello_world_query.execute().await
+    let user = container.get_user_query.execute(id).await?;
+    Ok(Json(user))
 }
 
-fn get_router<R>(container: Arc<Container<R>>) -> Router
+#[derive(Deserialize, Serialize)]
+struct CreateUserRequest {
+    username: String,
+    password: String,
+}
+
+async fn post_user<R, Q>(
+    State(container): State<Arc<Container<R, Q>>>,
+    Json(payload): Json<CreateUserRequest>,
+) -> Result<StatusCode, AppError>
 where
-    R: Repository + Send + Sync + 'static,
+    R: UserWriteRepository + Send + Sync + 'static,
+    Q: UserRepository + Send + Sync + 'static,
+{
+    container
+        .create_user_command
+        .execute(payload.username, payload.password)
+        .await?;
+    Ok(StatusCode::CREATED)
+}
+
+fn get_router<R, Q>(container: Arc<Container<R, Q>>) -> Router
+where
+    R: UserWriteRepository + Send + Sync + 'static,
+    Q: UserRepository + Send + Sync + 'static,
 {
     Router::new()
-        .route("/hello", axum::routing::get(handler))
+        .route("/users/{id}", axum::routing::get(get_user))
+        .route("/users", axum::routing::post(post_user))
         .with_state(container)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::app::query::get_hello_world::InMemoryRepository;
+
+    use crate::adapters::postgres::PostgresRepository;
 
     use super::*;
 
     use axum::body::Body;
-    use http_body_util::BodyExt;
+    use sqlx::PgPool;
     use tower::ServiceExt;
 
-    fn setup() -> Arc<Container<InMemoryRepository>> {
-        Arc::new(Container::new(InMemoryRepository))
-    }
-
-    #[tokio::test]
-    async fn test_get_router() {
-        let container = setup();
-        let app = get_router(container);
+    #[sqlx::test]
+    async fn test_post_user(pool: PgPool) {
+        let repo = PostgresRepository::new(pool.clone());
+        let container = Arc::new(Container::new(repo.clone(), repo));
+        let app = get_router(container.clone());
 
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/hello")
+                    .uri("/users")
+                    .method("POST")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"newuser","password":"newpassword"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    async fn test_get_router(pool: PgPool) {
+        let repo = PostgresRepository::new(pool.clone());
+        let container = Arc::new(Container::new(repo.clone(), repo));
+        let app = get_router(container.clone());
+
+        let user = container
+            .create_user_command
+            .execute("testuser".to_owned(), "testuserpassword".to_owned())
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/users/{}", user.id))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body, "Hello, World!");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(user.username, "testuser");
     }
 
-    #[tokio::test]
-    async fn not_found() {
+    #[sqlx::test]
+    async fn test_get_user_not_found(pool: PgPool) {
         // Given
-        let container = setup();
+        let repo = PostgresRepository::new(pool.clone());
+        let container = Arc::new(Container::new(repo.clone(), repo));
+        let app = get_router(container);
+
+        // When
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/users/99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Then
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn not_found(pool: PgPool) {
+        // Given
+        let repo = PostgresRepository::new(pool.clone());
+        let container = Arc::new(Container::new(repo.clone(), repo));
         let app = get_router(container);
 
         // When
